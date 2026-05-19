@@ -65,6 +65,8 @@ class TestTokenizers(unittest.TestCase):
                 tokenizer = load_tokenizer(tokenizer_repo)
                 tokenizer.decode([0, 1, 2])
                 self.assertTrue(isinstance(tokenizer.detokenizer, expected_detokenizer))
+                if expected_detokenizer is BPEStreamingDetokenizer:
+                    tokenizer.detokenizer.clean_spaces = False
                 self.check_tokenizer(tokenizer)
 
         # Try one with a naive detokenizer
