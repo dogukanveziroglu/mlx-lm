@@ -3,7 +3,7 @@
 import copy
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -92,7 +92,7 @@ def can_trim_prompt_cache(cache: List[Any]) -> bool:
     return all(c.is_trimmable() for c in cache)
 
 
-def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
+def trim_prompt_cache(cache: List[Any], num_tokens: int) -> int:
     """
     Trim the model's cache by the given number of tokens.
 
@@ -104,11 +104,12 @@ def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
         num_tokens (int): The number of tokens to trim.
 
     Returns:
-        (int): The number of tokens that were trimmed.
+        (int): The number of tokens that were trimmed from every layer. If
+        this is less than ``num_tokens``, the trim was incomplete.
     """
     if not can_trim_prompt_cache(cache) or len(cache) == 0:
         return 0
-    return [c.trim(num_tokens) for c in cache][0]
+    return min(c.trim(num_tokens) for c in cache)
 
 
 def create_attention_mask(
@@ -213,6 +214,9 @@ class ConcatenateKVCache(_BaseCache):
 
     def trim(self, n):
         n = min(self.offset, n)
+        if n > 0 and self.keys is not None:
+            self.keys = self.keys[..., : self.offset - n, :]
+            self.values = self.values[..., : self.offset - n, :]
         self.offset -= n
         return n
 
@@ -822,9 +826,7 @@ class CacheList(_BaseCache):
         return all(c.is_trimmable() for c in self.caches)
 
     def trim(self, n):
-        for c in self.caches:
-            m = c.trim(n)
-        return m
+        return min((c.trim(n) for c in self.caches), default=0)
 
     @property
     def state(self):
@@ -898,6 +900,17 @@ class CacheList(_BaseCache):
             globals()[c].from_state(s, m) for s, c, m in zip(state, *meta_state)
         ]
         return obj
+
+
+def _cache_window_has_slid(cache: Sequence[Any]) -> bool:
+    """Return whether a windowed cache has physically dropped leading tokens."""
+    for c in cache:
+        if isinstance(c, CacheList):
+            if _cache_window_has_slid(c.caches):
+                return True
+        elif getattr(c, "start_position", 0) > 0:
+            return True
+    return False
 
 
 def dynamic_roll(x, shifts, axis):
@@ -1599,7 +1612,7 @@ class PromptTrie:
 
         # Check if we found a prefix at any point
         shorter = None
-        if last_index > 0:
+        if last_index >= 0:
             shorter = tokens[: last_index + 1]
 
         # Check for sequences that are longer
@@ -1646,6 +1659,16 @@ class LRUPromptCache:
                 except ValueError:
                     pass
 
+        def touch(self, model: Any, tokens: List[Any]):
+            for cache_type in self._ordering:
+                lru = self._lrus[cache_type]
+                try:
+                    lru.remove((model, tokens))
+                except ValueError:
+                    continue
+                lru.append((model, tokens))
+                break
+
         def pop(self):
             i = 0
             while i + 1 < len(self._ordering):
@@ -1675,21 +1698,30 @@ class LRUPromptCache:
         result = self._trie.search(model, tokens)
         if result.exact is not None:
             cache_entry = self._trie.get(result.model, result.exact)
-            return copy.deepcopy(cache_entry.prompt_cache), []
+            cache = copy.deepcopy(cache_entry.prompt_cache)
+            self._lru.touch(result.model, result.exact)
+            return cache, []
 
         short_length = len(result.shorter) if result.shorter is not None else 0
         if result.longer is not None and result.common_prefix > short_length:
             cache_entry = self._trie.get(result.model, result.longer)
-            if can_trim_prompt_cache(cache_entry.prompt_cache):
+            # A slid window cannot reconstruct an arbitrary earlier prefix,
+            # even when trimming its retained suffix reports success.
+            if can_trim_prompt_cache(
+                cache_entry.prompt_cache
+            ) and not _cache_window_has_slid(cache_entry.prompt_cache):
                 cache = copy.deepcopy(cache_entry.prompt_cache)
                 prefix = min(len(tokens) - 1, result.common_prefix)
                 num_to_trim = len(result.longer) - prefix
-                trim_prompt_cache(cache, num_to_trim)
-                return cache, tokens[prefix:]
+                if trim_prompt_cache(cache, num_to_trim) == num_to_trim:
+                    self._lru.touch(result.model, result.longer)
+                    return cache, tokens[prefix:]
 
         if short_length > 0:
             cache_entry = self._trie.get(result.model, result.shorter)
-            return copy.deepcopy(cache_entry.prompt_cache), tokens[short_length:]
+            cache = copy.deepcopy(cache_entry.prompt_cache)
+            self._lru.touch(result.model, result.shorter)
+            return cache, tokens[short_length:]
 
         return None, tokens
 

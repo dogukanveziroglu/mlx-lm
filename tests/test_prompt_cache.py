@@ -15,7 +15,9 @@ from mlx_lm.models.cache import (
     BatchRotatingKVCache,
     CacheList,
     ChunkedKVCache,
+    ConcatenateKVCache,
     KVCache,
+    LRUPromptCache,
     QuantizedKVCache,
     RotatingKVCache,
     load_prompt_cache,
@@ -767,6 +769,154 @@ class TestPromptCache(unittest.TestCase):
         mask = create_attention_mask(h, c, window_size=4)
         expected = create_causal_mask(1, offset=32, window_size=4)
         self.assertTrue(mx.array_equal(mask, expected))
+
+
+class TestPromptCacheReuseContract(unittest.TestCase):
+    class PartialTrimCache:
+        def __init__(self, offset, max_trim):
+            self.offset = offset
+            self.max_trim = max_trim
+
+        @property
+        def nbytes(self):
+            return self.offset
+
+        def is_trimmable(self):
+            return True
+
+        def trim(self, n):
+            n = min(n, self.max_trim, self.offset)
+            self.offset -= n
+            return n
+
+    @staticmethod
+    def _position_kv(start, end):
+        positions = mx.arange(start, end, dtype=mx.float32).reshape(
+            1, 1, end - start, 1
+        )
+        return mx.broadcast_to(positions, (1, 1, end - start, 4))
+
+    def _prefill(self, cache, start, end, step=256):
+        for lo in range(start, end, step):
+            hi = min(lo + step, end)
+            kv = self._position_kv(lo, hi)
+            for c in cache:
+                if isinstance(c, ChunkedKVCache):
+                    c.maybe_trim_front()
+                c.update_and_fetch(kv, kv)
+
+    def _assert_partial_trim_is_rejected(self, prompt_cache, leaves):
+        lru = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+        key = list(range(16))
+        request = list(range(8)) + [99]
+        lru.insert_cache(model, key, prompt_cache)
+
+        fetched, rest = lru.fetch_nearest_cache(model, request)
+
+        self.assertIsNone(fetched)
+        self.assertEqual(rest, request)
+        self.assertTrue(all(c.offset == 16 for c in leaves))
+
+    def test_fetch_rejects_partial_trim(self):
+        full = KVCache()
+        self._prefill([full], 0, 16)
+        partial = self.PartialTrimCache(offset=16, max_trim=4)
+
+        self._assert_partial_trim_is_rejected([full, partial], [full, partial])
+
+    def test_fetch_rejects_nested_partial_trim(self):
+        full = KVCache()
+        self._prefill([full], 0, 16)
+        partial = self.PartialTrimCache(offset=16, max_trim=4)
+        cache = CacheList(partial, full)
+
+        self._assert_partial_trim_is_rejected([cache], [partial, full])
+
+    def test_fetch_falls_back_to_shorter_after_partial_trim(self):
+        lru = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+        longer_key = list(range(16))
+        shorter_key = list(range(2))
+        request = list(range(8)) + [99]
+
+        longer = self.PartialTrimCache(offset=16, max_trim=4)
+        shorter = KVCache()
+        self._prefill([shorter], 0, len(shorter_key))
+        lru.insert_cache(model, longer_key, [longer])
+        lru.insert_cache(model, shorter_key, [shorter])
+
+        fetched, rest = lru.fetch_nearest_cache(model, request)
+
+        self.assertIsNotNone(fetched)
+        self.assertIsInstance(fetched[0], KVCache)
+        self.assertEqual(fetched[0].offset, len(shorter_key))
+        self.assertEqual(rest, request[len(shorter_key) :])
+        self.assertEqual(longer.offset, len(longer_key))
+
+    def _assert_slid_window_is_rejected(self, prompt_cache, chunked):
+        lru = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+        key = list(range(1024))
+        original_offset = chunked.offset
+        original_start = chunked.start_position
+        self.assertGreater(original_start, 0)
+        prefix_length = original_start + 8
+        request = list(range(prefix_length)) + [9999]
+        lru.insert_cache(model, key, prompt_cache)
+
+        fetched, rest = lru.fetch_nearest_cache(model, request)
+
+        self.assertIsNone(fetched)
+        self.assertEqual(rest, request)
+        self.assertEqual(chunked.offset, original_offset)
+        self.assertEqual(chunked.start_position, original_start)
+
+    def test_fetch_rejects_slid_window(self):
+        chunked = ChunkedKVCache(chunk_size=512)
+        full = KVCache()
+        self._prefill([chunked, full], 0, 1024)
+
+        self._assert_slid_window_is_rejected([chunked, full], chunked)
+
+    def test_fetch_rejects_nested_slid_window(self):
+        chunked = ChunkedKVCache(chunk_size=512)
+        full = KVCache()
+        self._prefill([chunked, full], 0, 1024)
+
+        self._assert_slid_window_is_rejected([CacheList(chunked, full)], chunked)
+
+    def test_concatenate_cache_trim_drops_state(self):
+        cache = ConcatenateKVCache()
+        kv = self._position_kv(0, 8)
+        cache.update_and_fetch(kv, kv)
+
+        self.assertEqual(cache.trim(4), 4)
+        self.assertEqual(cache.offset, 4)
+        self.assertEqual(cache.keys[0, 0, :, 0].tolist(), [0.0, 1.0, 2.0, 3.0])
+        self.assertEqual(cache.values[0, 0, :, 0].tolist(), [0.0, 1.0, 2.0, 3.0])
+
+        new = self._position_kv(100, 101)
+        keys, values = cache.update_and_fetch(new, new)
+        self.assertEqual(cache.offset, 5)
+        self.assertEqual(keys[0, 0, :, 0].tolist(), [0.0, 1.0, 2.0, 3.0, 100.0])
+        self.assertEqual(values[0, 0, :, 0].tolist(), [0.0, 1.0, 2.0, 3.0, 100.0])
+
+    def test_slid_window_supports_suffix_rewind(self):
+        cache = ChunkedKVCache(chunk_size=512)
+        self._prefill([cache], 0, 1024)
+        original_offset = cache.offset
+        start_position = cache.start_position
+        self.assertGreater(start_position, 0)
+
+        self.assertEqual(trim_prompt_cache([cache], 2), 2)
+        self.assertEqual(cache.offset, original_offset - 2)
+        self.assertEqual(cache.start_position, start_position)
+
+        new = self._position_kv(2000, 2001)
+        keys, _ = cache.update_and_fetch(new, new)
+        self.assertEqual(cache.offset, original_offset - 1)
+        self.assertEqual(keys[0, 0, -1, 0].item(), 2000.0)
 
 
 if __name__ == "__main__":

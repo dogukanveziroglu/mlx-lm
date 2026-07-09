@@ -67,22 +67,25 @@ class DummyModelProvider:
 
 
 class MockCache:
-    def __init__(self, value, is_trimmable: bool = True):
-        self.value = value
+    def __init__(self, tokens, is_trimmable: bool = True):
+        self.tokens = list(tokens)
         self._is_trimmable = is_trimmable
 
     @property
     def nbytes(self):
-        return len(self.value)
+        return len(self.tokens)
 
     def __eq__(self, other):
-        return other.value == self.value
+        return isinstance(other, MockCache) and other.tokens == self.tokens
 
     def is_trimmable(self):
         return self._is_trimmable
 
     def trim(self, n):
         assert self._is_trimmable
+        n = min(n, len(self.tokens))
+        if n > 0:
+            self.tokens = self.tokens[:-n]
         return n
 
 
@@ -559,6 +562,27 @@ class TestKeepalive(unittest.TestCase):
 
 
 class TestLRUPromptCache(unittest.TestCase):
+    def _assert_hit_refreshes_recency(
+        self, key, request, expected_tokens, expected_rest
+    ):
+        cache = LRUPromptCache(max_size=2)
+        model = ("test", None, None)
+        cold_key = [20, 21]
+
+        cache.insert_cache(model, key, [MockCache(key)])
+        cache.insert_cache(model, cold_key, [MockCache(cold_key)])
+
+        fetched, rest = cache.fetch_nearest_cache(model, request)
+        self.assertEqual(fetched, [MockCache(expected_tokens)])
+        self.assertEqual(rest, expected_rest)
+
+        cache.insert_cache(model, [30, 31], [MockCache([30, 31])])
+        fetched, _ = cache.fetch_nearest_cache(model, key)
+        self.assertEqual(fetched, [MockCache(key)])
+        fetched, rest = cache.fetch_nearest_cache(model, cold_key)
+        self.assertIsNone(fetched)
+        self.assertEqual(rest, cold_key)
+
     def test_caching(self):
         cache = LRUPromptCache(max_size=10)
 
@@ -612,71 +636,90 @@ class TestLRUPromptCache(unittest.TestCase):
     def test_lru(self):
         cache = LRUPromptCache(max_size=2)
         model = ("test", None, None)
-        cache.insert_cache(model, [1, 2], [MockCache("test1")])
-        cache.insert_cache(model, [2, 3], [MockCache("test2")])
+        cache.insert_cache(model, [1, 2], [MockCache([1, 2])])
+        cache.insert_cache(model, [2, 3], [MockCache([2, 3])])
 
         c, t = cache.fetch_nearest_cache(model, [1, 2])
-        self.assertEqual(c, [MockCache("test1")])
+        self.assertEqual(c, [MockCache([1, 2])])
         self.assertEqual(t, [])
         c, t = cache.fetch_nearest_cache(model, [1])
-        self.assertEqual(c, [MockCache("test1")])
+        self.assertEqual(c, [MockCache([])])
         self.assertEqual(t, [1])
         c, t = cache.fetch_nearest_cache(model, [1, 3, 4])
-        self.assertEqual(c, [MockCache("test1")])
+        self.assertEqual(c, [MockCache([1])])
         self.assertEqual(t, [3, 4])
         c, t = cache.fetch_nearest_cache(model, [2, 3, 4])
-        self.assertEqual(c, [MockCache("test2")])
+        self.assertEqual(c, [MockCache([2, 3])])
         self.assertEqual(t, [4])
         c, t = cache.fetch_nearest_cache(model, [2, 4, 5])
-        self.assertEqual(c, [MockCache("test2")])
+        self.assertEqual(c, [MockCache([2])])
         self.assertEqual(t, [4, 5])
 
-        cache.insert_cache(model, [1, 2], [MockCache("test1")])
-        cache.insert_cache(model, [2, 3], [MockCache("test2")])
-        cache.insert_cache(model, [3, 4], [MockCache("test3")])
+        cache.insert_cache(model, [1, 2], [MockCache([1, 2])])
+        cache.insert_cache(model, [2, 3], [MockCache([2, 3])])
+        cache.insert_cache(model, [3, 4], [MockCache([3, 4])])
 
         c, t = cache.fetch_nearest_cache(model, [1, 2])
         self.assertEqual(c, None)
         self.assertEqual(t, [1, 2])
         c, t = cache.fetch_nearest_cache(model, [2, 3])
-        self.assertEqual(c, [MockCache("test2")])
+        self.assertEqual(c, [MockCache([2, 3])])
         self.assertEqual(t, [])
         c, t = cache.fetch_nearest_cache(model, [3, 4])
-        self.assertEqual(c, [MockCache("test3")])
+        self.assertEqual(c, [MockCache([3, 4])])
         self.assertEqual(t, [])
 
-        cache.insert_cache(model, [4, 5], [MockCache("test4")], cache_type="user")
+        cache.insert_cache(model, [4, 5], [MockCache([4, 5])], cache_type="user")
         c, t = cache.fetch_nearest_cache(model, [2, 3])
         self.assertEqual(c, None)
         self.assertEqual(t, [2, 3])
         c, t = cache.fetch_nearest_cache(model, [3, 4])
-        self.assertEqual(c, [MockCache("test3")])
+        self.assertEqual(c, [MockCache([3, 4])])
         self.assertEqual(t, [])
         c, t = cache.fetch_nearest_cache(model, [4, 5])
-        self.assertEqual(c, [MockCache("test4")])
+        self.assertEqual(c, [MockCache([4, 5])])
         self.assertEqual(t, [])
 
-        cache.insert_cache(model, [5, 6], [MockCache("test5")])
-        cache.insert_cache(model, [6, 7], [MockCache("test6")])
+        cache.insert_cache(model, [5, 6], [MockCache([5, 6])])
+        cache.insert_cache(model, [6, 7], [MockCache([6, 7])])
         c, t = cache.fetch_nearest_cache(model, [5, 6])
         self.assertEqual(c, None)
         self.assertEqual(t, [5, 6])
         c, t = cache.fetch_nearest_cache(model, [6, 7])
-        self.assertEqual(c, [MockCache("test6")])
+        self.assertEqual(c, [MockCache([6, 7])])
         self.assertEqual(t, [])
         c, t = cache.fetch_nearest_cache(model, [4, 5])
-        self.assertEqual(c, [MockCache("test4")])
+        self.assertEqual(c, [MockCache([4, 5])])
         self.assertEqual(t, [])
+
+    def test_one_token_nontrimmable_prefix(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+        cache.insert_cache(model, [7], [MockCache([7], is_trimmable=False)])
+
+        fetched, rest = cache.fetch_nearest_cache(model, [7, 8, 9])
+
+        self.assertEqual(fetched, [MockCache([7], is_trimmable=False)])
+        self.assertEqual(rest, [8, 9])
+
+    def test_exact_hit_refreshes_recency(self):
+        self._assert_hit_refreshes_recency([1, 2], [1, 2], [1, 2], [])
+
+    def test_shorter_hit_refreshes_recency(self):
+        self._assert_hit_refreshes_recency([1, 2], [1, 2, 9], [1, 2], [9])
+
+    def test_longer_hit_refreshes_recency(self):
+        self._assert_hit_refreshes_recency([1, 2, 3, 4], [1, 2, 9], [1, 2], [9])
 
     def test_insert_trimmable_cache_removes_immediate_prefix(self):
         cache = LRUPromptCache(max_size=10)
         model = ("test", None, None)
 
-        cache.insert_cache(model, [1, 2], [MockCache("ab")])
+        cache.insert_cache(model, [1, 2], [MockCache([1, 2])])
         self.assertEqual(len(cache), 1)
         self.assertEqual(cache.nbytes, 2)
 
-        cache.insert_cache(model, [1, 2, 3], [MockCache("abc")])
+        cache.insert_cache(model, [1, 2, 3], [MockCache([1, 2, 3])])
         self.assertEqual(len(cache), 1)
         self.assertEqual(cache.nbytes, 3)
 
@@ -684,9 +727,9 @@ class TestLRUPromptCache(unittest.TestCase):
         cache = LRUPromptCache(max_size=10)
         model = ("test", None, None)
 
-        cache.insert_cache(model, [], [MockCache("root")])
+        cache.insert_cache(model, [], [MockCache([])])
         self.assertEqual(len(cache), 1)
-        self.assertEqual(cache.nbytes, 4)
+        self.assertEqual(cache.nbytes, 0)
 
         c, t = cache.fetch_nearest_cache(model, [])
         self.assertIsNotNone(c)
@@ -696,8 +739,8 @@ class TestLRUPromptCache(unittest.TestCase):
         cache = LRUPromptCache(max_size=10)
         model = ("test", None, None)
 
-        cache.insert_cache(model, [], [MockCache("root")])
-        cache.insert_cache(model, [1], [MockCache("a")])
+        cache.insert_cache(model, [], [MockCache([])])
+        cache.insert_cache(model, [1], [MockCache([1])])
 
         c, t = cache.fetch_nearest_cache(model, [])
         self.assertIsNone(c)
@@ -707,10 +750,10 @@ class TestLRUPromptCache(unittest.TestCase):
         cache = LRUPromptCache(max_size=100, max_bytes=10)
         model = ("test", None, None)
 
-        cache.insert_cache(model, [1, 2], [MockCache("aaa")])
-        cache.insert_cache(model, [3, 4], [MockCache("bbb")])
-        cache.insert_cache(model, [4, 5], [MockCache("ccc")])
-        cache.insert_cache(model, [6, 7], [MockCache("ddd")])
+        cache.insert_cache(model, [1, 2, 3], [MockCache([1, 2, 3])])
+        cache.insert_cache(model, [4, 5, 6], [MockCache([4, 5, 6])])
+        cache.insert_cache(model, [7, 8, 9], [MockCache([7, 8, 9])])
+        cache.insert_cache(model, [10, 11, 12], [MockCache([10, 11, 12])])
 
         self.assertEqual(len(cache), 3)
         self.assertEqual(cache.nbytes, 9)
@@ -719,12 +762,12 @@ class TestLRUPromptCache(unittest.TestCase):
         self.assertEqual(len(cache), 2)
         self.assertEqual(cache.nbytes, 6)
 
-        c, t = cache.fetch_nearest_cache(model, [1, 2])
+        c, t = cache.fetch_nearest_cache(model, [1, 2, 3])
         self.assertEqual(c, None)
-        self.assertEqual(t, [1, 2])
-        c, t = cache.fetch_nearest_cache(model, [3, 4])
+        self.assertEqual(t, [1, 2, 3])
+        c, t = cache.fetch_nearest_cache(model, [4, 5, 6])
         self.assertEqual(c, None)
-        self.assertEqual(t, [3, 4])
+        self.assertEqual(t, [4, 5, 6])
 
 
 if __name__ == "__main__":
