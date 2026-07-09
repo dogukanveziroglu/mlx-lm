@@ -563,20 +563,30 @@ class TestKeepalive(unittest.TestCase):
 
 class TestLRUPromptCache(unittest.TestCase):
     def _assert_hit_refreshes_recency(
-        self, key, request, expected_tokens, expected_rest
+        self,
+        key,
+        request,
+        expected_tokens,
+        expected_rest,
+        *,
+        cache_type="assistant",
     ):
         cache = LRUPromptCache(max_size=2)
         model = ("test", None, None)
         cold_key = [20, 21]
 
-        cache.insert_cache(model, key, [MockCache(key)])
-        cache.insert_cache(model, cold_key, [MockCache(cold_key)])
+        cache.insert_cache(model, key, [MockCache(key)], cache_type=cache_type)
+        cache.insert_cache(
+            model, cold_key, [MockCache(cold_key)], cache_type=cache_type
+        )
 
         fetched, rest = cache.fetch_nearest_cache(model, request)
         self.assertEqual(fetched, [MockCache(expected_tokens)])
         self.assertEqual(rest, expected_rest)
 
-        cache.insert_cache(model, [30, 31], [MockCache([30, 31])])
+        cache.insert_cache(
+            model, [30, 31], [MockCache([30, 31])], cache_type=cache_type
+        )
         fetched, _ = cache.fetch_nearest_cache(model, key)
         self.assertEqual(fetched, [MockCache(key)])
         fetched, rest = cache.fetch_nearest_cache(model, cold_key)
@@ -706,7 +716,9 @@ class TestLRUPromptCache(unittest.TestCase):
         self._assert_hit_refreshes_recency([1, 2], [1, 2], [1, 2], [])
 
     def test_shorter_hit_refreshes_recency(self):
-        self._assert_hit_refreshes_recency([1, 2], [1, 2, 9], [1, 2], [9])
+        self._assert_hit_refreshes_recency(
+            [1, 2], [1, 2, 9], [1, 2], [9], cache_type="system"
+        )
 
     def test_longer_hit_refreshes_recency(self):
         self._assert_hit_refreshes_recency([1, 2, 3, 4], [1, 2, 9], [1, 2], [9])

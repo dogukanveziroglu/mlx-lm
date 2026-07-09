@@ -888,19 +888,26 @@ class TestPromptCacheReuseContract(unittest.TestCase):
 
     def test_concatenate_cache_trim_drops_state(self):
         cache = ConcatenateKVCache()
-        kv = self._position_kv(0, 8)
-        cache.update_and_fetch(kv, kv)
+        keys = self._position_kv(0, 8)
+        values = self._position_kv(1000, 1008)
+        cache.update_and_fetch(keys, values)
 
         self.assertEqual(cache.trim(4), 4)
         self.assertEqual(cache.offset, 4)
         self.assertEqual(cache.keys[0, 0, :, 0].tolist(), [0.0, 1.0, 2.0, 3.0])
-        self.assertEqual(cache.values[0, 0, :, 0].tolist(), [0.0, 1.0, 2.0, 3.0])
+        self.assertEqual(
+            cache.values[0, 0, :, 0].tolist(), [1000.0, 1001.0, 1002.0, 1003.0]
+        )
 
-        new = self._position_kv(100, 101)
-        keys, values = cache.update_and_fetch(new, new)
+        new_keys = self._position_kv(100, 101)
+        new_values = self._position_kv(1100, 1101)
+        keys, values = cache.update_and_fetch(new_keys, new_values)
         self.assertEqual(cache.offset, 5)
         self.assertEqual(keys[0, 0, :, 0].tolist(), [0.0, 1.0, 2.0, 3.0, 100.0])
-        self.assertEqual(values[0, 0, :, 0].tolist(), [0.0, 1.0, 2.0, 3.0, 100.0])
+        self.assertEqual(
+            values[0, 0, :, 0].tolist(),
+            [1000.0, 1001.0, 1002.0, 1003.0, 1100.0],
+        )
 
     def test_slid_window_supports_suffix_rewind(self):
         cache = ChunkedKVCache(chunk_size=512)
@@ -913,6 +920,7 @@ class TestPromptCacheReuseContract(unittest.TestCase):
         self.assertEqual(cache.offset, original_offset - 2)
         self.assertEqual(cache.start_position, start_position)
 
+        cache.maybe_trim_front()
         new = self._position_kv(2000, 2001)
         keys, _ = cache.update_and_fetch(new, new)
         self.assertEqual(cache.offset, original_offset - 1)
